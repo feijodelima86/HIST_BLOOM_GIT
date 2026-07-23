@@ -1,0 +1,86 @@
+---
+title: "Methods_Draft"
+author: "Feijo-Lima, Rafael"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Methods
+
+## 2.1 Study system and data sources
+
+The Upper Clark Fork River (UCFR), Montana, drains a watershed with a long legacy of metals contamination from historic mining and smelting, and its mainstem is subject to recurring blooms of the filamentous green alga *Cladophora glomerata*. We assembled a longitudinal dataset spanning seven mainstem monitoring sites, ordered upstream to downstream: DL, GR, BN, MS, BM, HU, and FH (site locations, USGS gauge numbers, and NCAR reach assignments given in Table 1 [TODO: build — full site names/coordinates not yet compiled]).
+
+Water chemistry (specific conductance, total phosphorus [TP], total nitrogen [TN], and associated analytes) came from the Tri-State Water Quality Council's Voluntary Nutrient Reduction Program (VNRP), which has sampled these sites biweekly through the growing season since 1998. Bloom biomass — chlorophyll-*a* (CHLa) and ash-free dry mass (AFDM) — has been sampled at discrete field visits since 2008, yielding 284 site-year-month-date observations across 2008–2025; some site-year-months contain two independent visits roughly 3–4 weeks apart, each retaining its own sampling date and hydrologic context (Section 2.2). CHLa is the response variable modeled here; AFDM was collected concurrently but is not used in this analysis.
+
+Daily discharge (Q) was obtained from USGS NWIS gauges (Table 1). Two sites required non-standard gauge assignments: FH used the St. Regis gauge, upstream of a discontinued downstream station, as a proxy; HU discharge was constructed as the sum of two contributing gauges (Bitterroot River and the mainstem gauge immediately upstream of their confluence). A two-visit discharge gap at GR reflects an actual gauge outage during those sampling dates and was retained as missing data rather than imputed.
+
+Future hydrologic scenarios were drawn from the NCAR SUMMA/mizuRoute simulation archive (NCAR Research Data Archive dataset d010014; https://doi.org/10.5065/8SAK-HM25), which provides daily routed discharge from 26 ESM–emission-scenario members (mixed CMIP5/CMIP6 vintage) at four reaches spanning the study sites (Table 1 gives the site-to-reach crosswalk; multiple sites share a reach where they sit on the same routed stream segment). Site-specific stream temperature projections came from the NorthWEST regional dataset, anchored at 2011, 2040, and 2080 per site and linearly interpolated between anchors, held flat outside that range.
+
+## 2.2 Chemistry–bloom matching and predictor derivation
+
+Because chemistry is sampled on a biweekly cadence while CHLa is sampled at discrete visits, we matched the two records at the site-year-month level: each month's chemistry observations were mean-aggregated, and that monthly mean was assigned to every bloom visit falling within the same site-year-month. Months containing two bloom visits therefore share one chemistry context but retain two distinct hydrologic contexts, since discharge-derived predictors were computed at the resolution of each visit's actual sampling date rather than a month-level approximation. [TODO: confirm and describe the antecedent-window selection procedure used in lag correlation analysis — how many months of lead chemistry were tested and what criterion selected the final window.]
+
+From the matched record we derived four hydrologic/thermal predictors at each bloom visit: log10-transformed discharge on the sampling date (logQ); a hydrologic disturbance index, anomaly = (peak Q / baseflow Q)^(1/3), computed from the preceding water year's discharge record; days since spring freshet onset (DSF), a phenological covariate intended to track successional exposure time since the last major scouring event; and log10 TP (µg/L). The response variable, CHLa, was log-transformed (logCHLa) to stabilize variance and satisfy the Gaussian-family assumption of the fitted model (Section 2.3).
+
+## 2.3 Bloom prediction model
+
+Water quality at these sites has previously been modeled using boosted regression trees (BRT) linking specific conductance, TP, and TN to bloom biomass. We instead fit a generalized additive model (GAM), which — unlike tree-based methods — produces smooth, extrapolable partial-effect curves rather than step-function predictions bounded by the training data's covariate range, a property essential for a model intended to project multiple decades beyond the observed climate envelope (Section 2.5). Of the VNRP chemistry variables, only TP was retained as a model predictor; specific conductance and TN, central to the earlier BRT framework, were not carried forward.
+
+We modeled log-transformed peak bloom biomass at each site-visit as an additive function of six terms, fit in the mgcv package in R:
+
+```
+logCHLa ~ s(lag_y, k=5) + s(anomaly, k=5) + s(logQ, k=5) +
+          s(Days_Since_Freshet, k=5) + s(logTP, k=10) + s(Temp_oC, k=10) +
+          s(Site, bs="re")
+```
+
+`lag_y` is the prior observed (or, in projection mode, previously predicted) peak logCHLa at the same site, included to capture bloom persistence independent of the five environmental covariates. Basis dimensions (k) were set conservatively for the four lower-complexity terms and relaxed for TP and temperature, which showed more structured partial effects during model development; estimated degrees of freedom for all six terms remained comfortably below their respective k ceilings. `Site` entered as a random-effect smooth (`bs="re"`) rather than a fixed factor, allowing site identity to absorb unmodeled longitudinal structure (geochemistry, point-source proximity, channel geomorphology) without the parameter cost of a categorical predictor; the rationale for retaining this term rather than treating site identity as a modeling weakness is addressed via the leave-one-site-out diagnostic (Section 2.4).
+
+The model was fit on n = 221 site-visit observations, retained from an initial pool of 284 raw visit-level records after requiring complete cases across all six predictors (n = 246) and two iterative rounds of outlier exclusion [TODO: confirm exact exclusion criterion, e.g. |z| > 2 SD on logCHLa vs. on model residuals].
+
+A companion GAM predicted log10 TP as a function of the four purely hydrologic/thermal drivers plus the site random effect:
+
+```
+logTP ~ s(anomaly) + s(logQ) + s(Days_Since_Freshet) + s(Temp_oC) + s(Site, bs="re")
+```
+
+This submodel plays no role in explaining observed bloom variance; its sole purpose is to generate a projected logTP value under future hydrologic and thermal conditions, since TP itself is not simulated by the NCAR climate archive (Section 2.5).
+
+## 2.4 Model validation
+
+We evaluated three complementary validation schemes, each targeting a different failure mode relevant to a model intended for multi-decade extrapolation.
+
+**Leave-one-year-out (LOYO) cross-validation** iteratively withheld all observations from a single calendar year, refit the model on the remaining years, and predicted the withheld year. This is our primary validation metric, since it tests generalization to conditions from an unseen year — the closest analog to genuine forecasting.
+
+**Forward-chaining validation** trained the model on all years up to and including year *t* and predicted year *t*+1, repeated across the observed record, confirming that LOYO performance was not inflated by information leaking backward from future years into the training set used for earlier withheld years.
+
+**Leave-one-site-out (LOSO) cross-validation** withheld all observations from a single site — necessarily excluding the site random effect, which cannot be estimated for an unseen site — and predicted that site from the remaining sites' fitted relationships. We report LOSO as a supplementary transparency diagnostic rather than a primary claim: because the site random effect is deliberately retained in the production model to carry real longitudinal structure (Section 2.3), LOSO understates the model's actual within-sample performance and instead answers a stricter, spatial-generalization-only question the model was not designed for.
+
+To isolate how much of LOYO performance reflects genuine environmental mechanism rather than bloom persistence alone, we additionally fit a lag-only baseline GAM (`logCHLa ~ s(lag_y) + s(Site, bs="re")`) under the same LOYO scheme; the gap between full-model and lag-only LOYO performance quantifies the mechanistic contribution of the five environmental predictors beyond simple year-to-year persistence.
+
+Finally, because the projection procedure (Section 2.5) recursively feeds each year's prediction forward as the next year's `lag_y`, compounding error over a multi-decade horizon was a specific concern. We validated this recursive mode directly: starting from an observed anchor year, we generated multi-year-ahead predictions using only the model's own prior output (never re-anchoring to observed data) and tracked prediction error as a function of steps ahead, to confirm error does not grow unboundedly over a realistic projection horizon.
+
+We additionally checked for concurvity — the GAM analog of multicollinearity — among the six mechanistic smooth terms, confirming no pair of predictors was redundant enough to leave their individual partial effects unidentifiable.
+
+## 2.5 Climate projection framework
+
+**Climate envelopes.** For each of the four NCAR reaches (Table 1), we computed a 20-year moving-average (MA20) smoothed discharge envelope from the 26-member ESM ensemble: for each water year we extracted peak, baseflow (annual minimum), and mean discharge, applied MA20 smoothing to each series independently, and only then computed the hydrologic disturbance index (anomaly = (peak_MA20 / baseflow_MA20)^(1/3)) — smoothing before ratioing, rather than smoothing an already-noisy year-to-year ratio directly. Two emission-scenario brackets were retained — a low bracket (RCP4.5/SSP2-4.5) and a high bracket (RCP8.5/SSP5-8.5) — with SSP3-7.0 members dropped from the ensemble to preserve a clean two-bracket comparison. Site-specific temperature trajectories were assigned by bracket directly from the NorthWEST dataset rather than joined by individual ESM/scenario, since NorthWEST is not resolved at that granularity; the high bracket was additionally offset relative to the low bracket by +0.5°C at the 2040 anchor and +1.5°C at the 2080 anchor, derived from the emission-scenario spread reported in MCA (2017) and scaled by an air-to-stream temperature conversion factor of 0.7.
+
+**Delta-anchoring.** Following standard practice for regional hydrologic simulation archives, we treated the NCAR ensemble as informative about the shape and magnitude of future *change* rather than as a bias-corrected replacement for observed conditions (Coxon et al., *Scientific Data*). We therefore computed a baseline climatology (1981–2010) entirely from the NCAR-simulated record — available at full temporal coverage for every reach regardless of gauge history — and separately computed an observed climatological anchor for each site as the mean of that site's actual observed bloom-visit predictor values across 2008–2025. Projected future predictor values were generated by applying the NCAR-simulated change between the future window and the NCAR baseline to the observed anchor, rather than substituting raw NCAR-simulated values directly into a model fit on the observed record's scale. Three predictors were delta-anchored this way: logQ (log-additive), anomaly (multiplicative ratio), and DSF (additive, with a sign correction since the NCAR day-of-water-year convention runs inversely to observed DSF). Temperature entered directly from the bracket-assigned NorthWEST trajectory without delta-anchoring, since NorthWEST already provides site-specific absolute projections rather than a raw simulation requiring bias correction. Projected logTP was generated by passing the three delta-anchored predictors plus projected temperature through the TP submodel (Section 2.3) rather than delta-anchoring TP directly, since TP has no analog in the NCAR archive against which to compute a baseline-to-future change. Figure [X] gives all four operations in full.
+
+**Recursive projection.** For each of 21 ensemble members (10 low-bracket, 11 high-bracket) at each of the seven sites, we generated annual predictions from 2026 through 2098 (the extent of NCAR ensemble coverage) by stepping the fitted model forward one water year at a time: each year's five environmental predictors were computed as above, `lag_y` was set to the previous year's prediction (with the first projected year seeded from each site's observed 2025 peak logCHLa), and the resulting prediction both became that year's output and the following year's `lag_y`. Because early projection years are necessarily dominated by the observed 2025 seed rather than the climate signal, we treat approximately the first projected decade as a relaxation period rather than an interpretable trend (consistent with the recursive-mode validation in Section 2.4).
+
+## 2.6 Driver decomposition
+
+To attribute projected change in logCHLa to individual predictors, we exploited the additive structure of the GAM: `predict(m1, type="terms")` returns the exact partial contribution of each smooth term to a given prediction, which — because the model is additive on the link scale — sum to the total prediction plus intercept and site effect. For each site, we compared the mean per-term contribution in an early projection window (2026–2035) against a late window (2089–2098), expressing each term's contribution to that change as a percentage of the total absolute change. `lag_y` is reported separately as a persistence/inherited term rather than a climate forcing, and logTP's contribution is reported as hydrology-mediated, since it is itself a function of the other predictors via the TP submodel rather than an independent driver. This decomposition uses each year's realized term values and therefore does not capture amplification arising from a driver's compounding influence through `lag_y` over decades of recursive feedback.
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

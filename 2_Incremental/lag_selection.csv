@@ -1,0 +1,12 @@
+Variable,Best_Lag,Best_r,Best_n
+DIN_mg_L,August,0.319,224
+NH4_mg_L,July,0.102,210
+NO3_mg_L,September,0.316,240
+SPC,June,0.671,70
+SRP_mg_L,June,0.375,56
+TDS,June,0.578,70
+TN_mg_L,June,0.494,44
+TP_mg_L,June,0.253,70
+TURBIDITY,June,-0.328,70
+Temp_oC,September,-0.258,259
+pH,July,0.225,282
