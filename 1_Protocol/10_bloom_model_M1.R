@@ -9,12 +9,38 @@
 #          console: scorecard data frame
 #
 # This script is the single source of truth for what M1 is.
-# All downstream scripts (08_temporal_validation.R, projection pipeline)
+# All downstream scripts (11_temporal_validation.R, projection pipeline)
 # load 3_models/bloom_model_M1.rds rather than re-specifying the formula.
 #
 # Model: RESPONSE ~ s(lag_y) + s(anomaly) + s(logQ_obs_cfs) +
-#                   s(Days_Since_Freshet) + s(logTP_mg_L) + s(Temp_oC) +
-#                   s(Site, bs="re")
+#                   s(Days_Since_Freshet) + s(logTP_mg_L) + s(Temp_oC)
+#
+# REVISION 2026-07-23: Site random effect s(Site, bs="re") REMOVED from the
+# default configuration (see SITE_RE toggle below). A concurvity audit
+# (12_concurvity.R) found s(Site) <-> s(logQ_obs_cfs) worst-case concurvity
+# of 0.96 -- Site was absorbing nearly all of logQ's between-site signal,
+# which also explains why lag_y and logQ looked non-significant in-sample
+# despite carrying real held-out predictive skill. Dropping Site clears the
+# concurvity flag entirely and every remaining term becomes significant, at
+# a real but modest LOYO cost (0.710 -> ~0.67-0.69 depending on shrinkage;
+# re-verify under this script's own defaults, not just the sandbox trial).
+# See dev_chla_candidate.R trial history for the full comparison.
+#
+# This is a DIFFERENT call than the TP submodel, which KEEPS Site
+# (09_tp_submodel.R unchanged) -- there, Site carries two specific,
+# non-substitutable mechanisms (BM's WWTP point source, GR/BN geologic P),
+# confirmed by LOSO collapsing to R2 < -2 without it. Here, no comparably
+# specific mechanism was identified for what Site was capturing beyond a
+# generic downstream/discharge-magnitude gradient that logQ_obs_cfs already
+# tracks.
+#
+# IMPORTANT DOWNSTREAM CONSEQUENCE, not yet resolved: 13_project_bloom.R
+# currently gets per-site projection differentiation from Site's fitted
+# intercept. Without it, two sites with similar projected
+# anomaly/logQ/DSF/logTP/Temp trajectories will get near-identical
+# projected bloom trajectories, even if they have real, unexplained
+# baseline differences Site RE used to carry. Understand this before
+# regenerating any projection-stage figure or table.
 #
 # lag_y = previous year's site-level annual max of RESPONSE.
 #         Represents Cladophora propagule bank legacy (overwinters as
@@ -24,15 +50,21 @@
 # logAFDM is derived in-script (log10(AFDM)) if RESPONSE = "logAFDM".
 #         Not present as a column in ucfr_model_ready.csv.
 #
-# LOSO validation uses RE-excluded population-level predictions for held-out
-# sites (same mgcv::exclude pattern as 09_tp_submodel.R). RE is load-bearing
-# in the full-data fit but correctly excluded when testing spatial
-# generalization to a novel site with no fitted intercept.
+# LOSO validation: when SITE_RE = TRUE, uses RE-excluded population-level
+# predictions for held-out sites (same mgcv::exclude pattern as
+# 09_tp_submodel.R). When SITE_RE = FALSE (current default), no exclude is
+# needed -- the held-out site's rows predict exactly like any other row,
+# since Site was never a model term. This also means LOSO now tests the
+# actual production model's spatial generalization directly, rather than a
+# deliberately RE-crippled version of a different model.
 #
 # Row identity: obs_id (1:n in input row order) is the stable key for the
 # predictions CSV. Site+Year+Month alone is not unique — n=284 includes
 # double-visit months where two sampling events in the same month have
 # distinct Days_Since_Freshet and Q_obs_cfs values.
+#
+# After refitting: re-run 12_concurvity.R against the new
+# bloom_model_M1.rds to confirm the concurvity picture looks as expected.
 # ============================================================================
 
 library(mgcv)
@@ -43,6 +75,10 @@ library(mgcv)
 RESPONSE       <- "logCHLa"   # "logCHLa" or "logAFDM"
 OUTLIER_SD     <- 2.0         # residual SD threshold for outlier removal
 OUTLIER_ROUNDS <- 2           # number of outlier removal passes
+
+# Site random effect -- see REVISION note above. Toggle back to TRUE for a
+# sensitivity re-check; LOSO logic below (Section 8) handles both cases.
+SITE_RE        <- FALSE
 
 # Per-variable basis dimensions.
 # Higher k for logTP and Temp: both showed non-monotonic partial responses
@@ -121,10 +157,12 @@ smooth_terms <- mapply(
   function(v, k) paste0("s(", v, ", k=", k, ")"),
   PREDICTORS, k_spec[PREDICTORS]
 )
-re_term  <- 's(Site, bs="re")'
+all_terms <- smooth_terms
+if (SITE_RE) all_terms <- c(all_terms, 's(Site, bs="re")')
+
 f_M1 <- as.formula(
   paste(RESPONSE, "~",
-        paste(c(smooth_terms, re_term), collapse = " + "))
+        paste(all_terms, collapse = " + "))
 )
 
 # ============================================================================
@@ -194,10 +232,11 @@ saveRDS(m_M1, "3_models/bloom_model_M1.rds")
 # ============================================================================
 # 8. LOSO VALIDATION
 # ============================================================================
-# RE excluded for held-out sites: predict at population level
-# (no site-specific intercept for a genuinely novel site).
-# LOSO is the spatial generalization test — tests the six mechanistic
-# predictors alone, without site identity acting as a crutch.
+# SITE_RE = TRUE : RE excluded for held-out sites, predicting at population
+#                  level (no site-specific intercept for a novel site).
+# SITE_RE = FALSE: no exclude needed -- Site was never a model term, so the
+#                  held-out site's rows predict exactly like any other row.
+#                  LOSO now tests the actual production model directly.
 #
 # Reported as:
 #   (a) pooled R² vs grand mean of all held-out observations
@@ -219,12 +258,16 @@ for (s in sites) {
   )
   if (is.null(m_loso)) next
   
-  # Assign held-out site a dummy level from training data, then exclude RE
-  test2        <- test
-  test2$Site   <- factor(levels(train$Site)[1], levels = levels(train$Site))
-  pred_loso    <- predict(m_loso, newdata = test2,
-                          exclude = 's(Site, bs="re")',
-                          newdata.guaranteed = TRUE)
+  if (SITE_RE) {
+    # Assign held-out site a dummy level from training data, then exclude RE
+    test2        <- test
+    test2$Site   <- factor(levels(train$Site)[1], levels = levels(train$Site))
+    pred_loso    <- predict(m_loso, newdata = test2,
+                            exclude = 's(Site, bs="re")',
+                            newdata.guaranteed = TRUE)
+  } else {
+    pred_loso <- predict(m_loso, newdata = test)
+  }
   
   obs_loso     <- test[[RESPONSE]]
   ss_res       <- sum((obs_loso - pred_loso)^2)
@@ -299,6 +342,7 @@ cat("\n")
 cat("============================================================\n")
 cat("M1 BLOOM MODEL — SCORECARD\n")
 cat("Response:", RESPONSE, "\n")
+cat("Site random effect included:", SITE_RE, "\n")
 cat("Formula:", deparse(f_M1, width.cutoff = 120), "\n")
 cat("============================================================\n\n")
 
@@ -345,7 +389,7 @@ cat("\n")
 
 # --- 10d. LOSO spatial validation ---
 loso_sc <- data.frame(
-  Scheme   = "LOSO (RE excluded)",
+  Scheme   = paste0("LOSO", if (SITE_RE) " (RE excluded)" else " (no Site term)"),
   n        = nrow(loso_df),
   R2_pooled = round(r2_loso_pooled, 4),
   RMSE     = round(rmse_loso, 4),
@@ -384,4 +428,5 @@ cat("============================================================\n")
 cat("Done. M1 is the canonical bloom model.\n")
 cat("Downstream scripts load 3_models/bloom_model_M1.rds.\n")
 cat("Do not re-specify the formula elsewhere.\n")
+cat("Re-run 12_concurvity.R next to confirm the concurvity picture.\n")
 cat("============================================================\n")
